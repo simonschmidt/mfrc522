@@ -22,7 +22,9 @@
 //! [2]: https://www.nxp.com/docs/en/data-sheet/MFRC522.pdf
 
 #![allow(dead_code)]
-#![deny(missing_docs)]
+// TODO deny again
+// #![deny(missing_docs)]
+
 // NOTE: OutputPin v1/v2 business will warn
 // #![deny(warnings)]
 #![no_std]
@@ -40,6 +42,9 @@ use hal::spi::{Mode, Phase, Polarity};
 
 mod picc;
 
+// #[cfg(test)]
+pub mod testutils;
+
 /// Errors
 #[derive(Debug)]
 pub enum Error<E> {
@@ -53,6 +58,8 @@ pub enum Error<E> {
     Crc,
     /// Incomplete RX frame
     IncompleteFrame,
+    /// Not enough room in buffer
+    BufferTooSmall,
     /// Internal temperature sensor detects overheating
     Overheating,
     /// Parity check failed
@@ -79,7 +86,8 @@ pub enum Error<E> {
 
 /// MFRC522 driver
 pub struct Mfrc522<SPI, NSS> {
-    spi: SPI,
+    /// TODO make private again
+    pub spi: SPI,
     nss: NSS,
 }
 
@@ -127,13 +135,87 @@ where
         Ok(mfrc522)
     }
 
+    /// Stop crypto
+    /// Must be called after `self.authenticate` to return to normal functionality
+    /// Called by `self.with_authentication`
+    pub fn stop_crypto(&mut self) -> Result<(), Error<E>> {
+        // Status2Reg[7..0] bits are: TempSensClear I2CForceHS reserved reserved MFCrypto1On ModemState[2:0]
+        self.rmw(Register::Status2Reg, |v| v & (!0x08))
+            .map_err(Error::Spi)?;
+        Ok(())
+    }
+
+    /// Run function in authentication context
+    /// ensures crypto is stopped after `f` is called
+    pub fn with_authentication<F, T>(&mut self, f: F) -> Result<T, Error<E>>
+    where
+        F: FnOnce(&mut Self) -> Result<T, Error<E>>,
+    {
+        let result = f(self);
+        self.stop_crypto()?;
+        result
+    }
+
+    /// 10.3.1.9 MFAuthent
+    /// Authenticate
+    /// `self.stop_crypto` must be called after this to resume
+    /// normal operation, prefer `self.with_authentication`
+    pub fn authenticate(
+        &mut self,
+        block_addr: u8,
+        sector_key: &Key,
+        uid: &Uid,
+    ) -> Result<(), Error<E>> {
+        let mut tx_buffer: [u8; 12] = [0; 12];
+        tx_buffer[0] = picc::AUTH_KEY_A; // TODO arg, also allow key b
+        tx_buffer[1] = block_addr;
+
+        let key_bytes = sector_key.bytes();
+        for i in 0..(key_bytes.len()) {
+            tx_buffer[2 + i] = key_bytes[i];
+        }
+
+        // Use the last uid bytes as specified in http://cache.nxp.com/documents/application_note/AN10927.pdf
+        // section 3.2.5 "MIFARE Classic Authentication".
+        // The only missed case is the MF1Sxxxx shortcut activation,
+        // but it requires cascade tag (CT) byte, that is not part of uid.
+        let uid_bytes = uid.bytes();
+        for i in 0..4 {
+            // The last 4 bytes of the UID
+            tx_buffer[8 + i] = (uid_bytes[i + uid_bytes.len() - 4]).clone();
+        }
+
+        // Start the authentication.
+        // TODO in PCD_authinticate only IdleIrq is looked for
+        self.communicate(Command::MFAuthent, &tx_buffer, 0x80, 1 << 3)?;
+
+        Ok(())
+    }
+
+    /// READ, TODO document
+    pub fn mifare_read(&mut self, block_addr: u8, buffer: &mut [u8]) -> Result<(), Error<E>> {
+        if buffer.len() < 18 {
+            return Err(Error::BufferTooSmall);
+        }
+
+        buffer[0] = picc::MIFARE_READ;
+        buffer[1] = block_addr;
+        let result = self.calculate_crc(&buffer[0..2])?;
+        buffer[2] = result[0];
+        buffer[3] = result[1];
+
+        // TODO: tx_last_bits or not?
+        self.communicate(Command::Transceive, &buffer[0..4], 0, 1 << 3)?;
+        self.read_fifo(buffer)?;
+        Ok(())
+    }
+
     /// Sends a REQuest type A to nearby PICCs
     pub fn reqa<'b>(&mut self) -> Result<AtqA, Error<E>> {
         // NOTE REQA is a short frame (7 bits)
         self.transceive(&[picc::REQA], 7)
             .map(|bytes| AtqA { bytes })
     }
-
     /// Selects an idle PICC
     ///
     /// NOTE currently this only supports single size UIDs
@@ -271,6 +353,7 @@ where
         cmd: Command,
         tx_buffer: &[u8],
         tx_last_bits: u8,
+        rx_align: u8,
     ) -> Result<(), Error<E>> {
         // stop any ongoing command
         self.command(Command::Idle).map_err(Error::Spi)?;
@@ -289,7 +372,7 @@ where
         self.command(cmd).map_err(Error::Spi)?;
 
         // configure short frame and start transmission
-        self.write(Register::BitFraming, (1 << 7) | tx_last_bits)
+        self.write(Register::BitFraming, (rx_align << 4) | tx_last_bits)
             .map_err(Error::Spi)?;
 
         // TODO timeout when connection to the MFRC522 is lost (?)
@@ -322,9 +405,10 @@ where
     where
         RX: ArrayLength<u8>,
     {
-        self.communicate(Command::Transceive, tx_buffer, tx_last_bits)?;
+        self.communicate(Command::Transceive, tx_buffer, tx_last_bits, 1 << 3)?;
         // grab RX data
-        let mut rx_buffer: GenericArray<u8, RX> = unsafe { mem::uninitialized() };
+        let mut rx_buffer: GenericArray<u8, RX> =
+            unsafe { mem::MaybeUninit::uninit().assume_init() };
         self.read_fifo(&mut rx_buffer)?;
         Ok(rx_buffer)
     }
@@ -409,6 +493,7 @@ pub const MODE: Mode = Mode {
     phase: Phase::CaptureOnFirstTransition,
 };
 
+/// 10.3 MFRC522 command overview (Table 149.)
 #[derive(Clone, Copy)]
 enum Command {
     Idle,
@@ -440,8 +525,9 @@ impl Command {
     }
 }
 
+#[allow(missing_docs)]
 #[derive(Clone, Copy)]
-enum Register {
+pub enum Register {
     BitFraming = 0x0d,
     Coll = 0x0e,
     ComIrq = 0x04,
@@ -458,6 +544,7 @@ enum Register {
     ReloadH = 0x2c,
     ReloadL = 0x2d,
     RxMode = 0x13,
+    Status2Reg = 0x08,
     TCountValH = 0x2e,
     TCountValL = 0x2f,
     TMode = 0x2a,
@@ -477,7 +564,8 @@ impl Register {
         ((*self as u8) << 1) | R
     }
 
-    fn write_address(&self) -> u8 {
+    /// TODO unpub
+    pub fn write_address(&self) -> u8 {
         ((*self as u8) << 1) | W
     }
 }
@@ -503,5 +591,28 @@ impl Uid {
     /// Is the PICC compliant with ISO/IEC 14443-4?
     pub fn is_compliant(&self) -> bool {
         self.compliant
+    }
+}
+
+/// Authentication key
+#[derive(Debug)]
+pub struct Key {
+    bytes: [u8; 6],
+}
+
+impl Key {
+    /// Create new key
+    pub fn new(bytes: [u8; 6]) -> Key {
+        Key { bytes: bytes }
+    }
+
+    /// Get the default key
+    pub fn default() -> Key {
+        Key::new([0xff, 0xff, 0xff, 0xff, 0xff, 0xff])
+    }
+
+    /// The bytes of the key
+    pub fn bytes(&self) -> &[u8; 6] {
+        &self.bytes
     }
 }

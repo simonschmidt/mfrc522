@@ -2,3 +2,7 @@
 .#*
 /target/
 Cargo.lock
+memory.x
+.idea
+openocd.cfg
+openocd.gdb
