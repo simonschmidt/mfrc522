@@ -22,7 +22,9 @@
 //! [2]: https://www.nxp.com/docs/en/data-sheet/MFRC522.pdf
 
 #![allow(dead_code)]
-#![deny(missing_docs)]
+// TODO deny again
+// #![deny(missing_docs)]
+
 // NOTE: OutputPin v1/v2 business will warn
 // #![deny(warnings)]
 #![no_std]
@@ -38,7 +40,16 @@ use hal::blocking::spi;
 use hal::digital::OutputPin;
 use hal::spi::{Mode, Phase, Polarity};
 
+mod access;
 mod picc;
+
+mod mifare;
+pub use mifare::Mifare;
+
+// #[cfg(test)]
+pub mod testutils;
+
+pub use access::{Key, SectorTrailer};
 
 /// Errors
 #[derive(Debug)]
@@ -53,6 +64,10 @@ pub enum Error<E> {
     Crc,
     /// Incomplete RX frame
     IncompleteFrame,
+    /// MIFARE NACK
+    MifareNack,
+    /// Unsuitable buffer size
+    BufferSize,
     /// Internal temperature sensor detects overheating
     Overheating,
     /// Parity check failed
@@ -79,7 +94,8 @@ pub enum Error<E> {
 
 /// MFRC522 driver
 pub struct Mfrc522<SPI, NSS> {
-    spi: SPI,
+    /// TODO make private again
+    pub spi: SPI,
     nss: NSS,
 }
 
@@ -127,13 +143,69 @@ where
         Ok(mfrc522)
     }
 
+    /// Stop crypto
+    /// Must be called after `self.authenticate` to return to normal functionality
+    /// Called by `self.with_authentication`
+    pub fn stop_crypto(&mut self) -> Result<(), Error<E>> {
+        // Status2Reg[7..0] bits are: TempSensClear I2CForceHS reserved reserved MFCrypto1On ModemState[2:0]
+        self.rmw(Register::Status2Reg, |v| v & (!0x08))
+            .map_err(Error::Spi)?;
+        Ok(())
+    }
+
+    /// Run function in authentication context
+    /// ensures crypto is stopped after `f` is called
+    pub fn with_authentication<F, T>(&mut self, f: F) -> Result<T, Error<E>>
+    where
+        F: FnOnce(&mut Self) -> Result<T, Error<E>>,
+    {
+        let result = f(self);
+        self.stop_crypto()?;
+        result
+    }
+
+    /// 10.3.1.9 MFAuthent
+    /// Authenticate
+    /// `self.stop_crypto` must be called after this to resume
+    /// normal operation, prefer `self.with_authentication`
+    pub fn authenticate(
+        &mut self,
+        block_addr: u8,
+        sector_key: &Key,
+        uid: &Uid,
+    ) -> Result<(), Error<E>> {
+        let mut tx_buffer: [u8; 12] = [0; 12];
+        tx_buffer[0] = picc::AUTH_KEY_A; // TODO arg, also allow key b
+        tx_buffer[1] = block_addr;
+
+        let key_bytes = sector_key.bytes();
+        for i in 0..(key_bytes.len()) {
+            tx_buffer[2 + i] = key_bytes[i];
+        }
+
+        // Use the last uid bytes as specified in http://cache.nxp.com/documents/application_note/AN10927.pdf
+        // section 3.2.5 "MIFARE Classic Authentication".
+        // The only missed case is the MF1Sxxxx shortcut activation,
+        // but it requires cascade tag (CT) byte, that is not part of uid.
+        let uid_bytes = uid.bytes();
+        for i in 0..4 {
+            // The last 4 bytes of the UID
+            tx_buffer[8 + i] = (uid_bytes[i + uid_bytes.len() - 4]).clone();
+        }
+
+        // Start the authentication.
+        // TODO in PCD_authenticate only IdleIrq is looked for
+        self.communicate(Command::MFAuthent, &tx_buffer, 0x80, 1 << 3)?;
+
+        Ok(())
+    }
+
     /// Sends a REQuest type A to nearby PICCs
     pub fn reqa<'b>(&mut self) -> Result<AtqA, Error<E>> {
         // NOTE REQA is a short frame (7 bits)
         self.transceive(&[picc::REQA], 7)
             .map(|bytes| AtqA { bytes })
     }
-
     /// Selects an idle PICC
     ///
     /// NOTE currently this only supports single size UIDs
@@ -194,7 +266,7 @@ where
         self.read(Register::Version)
     }
 
-    fn calculate_crc(&mut self, data: &[u8]) -> Result<[u8; 2], Error<E>> {
+    pub fn calculate_crc(&mut self, data: &[u8]) -> Result<[u8; 2], Error<E>> {
         // stop any ongoing command
         self.command(Command::Idle).map_err(Error::Spi)?;
 
@@ -271,6 +343,7 @@ where
         cmd: Command,
         tx_buffer: &[u8],
         tx_last_bits: u8,
+        rx_align: u8,
     ) -> Result<(), Error<E>> {
         // stop any ongoing command
         self.command(Command::Idle).map_err(Error::Spi)?;
@@ -289,7 +362,7 @@ where
         self.command(cmd).map_err(Error::Spi)?;
 
         // configure short frame and start transmission
-        self.write(Register::BitFraming, (1 << 7) | tx_last_bits)
+        self.write(Register::BitFraming, (rx_align << 4) | tx_last_bits)
             .map_err(Error::Spi)?;
 
         // TODO timeout when connection to the MFRC522 is lost (?)
@@ -322,15 +395,16 @@ where
     where
         RX: ArrayLength<u8>,
     {
-        self.communicate(Command::Transceive, tx_buffer, tx_last_bits)?;
+        self.communicate(Command::Transceive, tx_buffer, tx_last_bits, 1 << 3)?;
         // grab RX data
-        let mut rx_buffer: GenericArray<u8, RX> = unsafe { mem::uninitialized() };
+        let mut rx_buffer: GenericArray<u8, RX> =
+            unsafe { mem::MaybeUninit::uninit().assume_init() };
         self.read_fifo(&mut rx_buffer)?;
         Ok(rx_buffer)
     }
 
     // lowest level  API
-    fn read(&mut self, reg: Register) -> Result<u8, E> {
+    pub fn read(&mut self, reg: Register) -> Result<u8, E> {
         let mut buffer = [reg.read_address(), 0];
 
         self.with_nss_low(|mfr| {
@@ -379,7 +453,7 @@ where
         })
     }
 
-    fn read_fifo(&mut self, rx_buffer: &mut [u8]) -> Result<(), Error<E>> {
+    pub fn read_fifo(&mut self, rx_buffer: &mut [u8]) -> Result<(), Error<E>> {
         let received_bytes = self.read(Register::FifoLevel).map_err(Error::Spi)?;
 
         if received_bytes as usize != rx_buffer.len() {
@@ -409,6 +483,7 @@ pub const MODE: Mode = Mode {
     phase: Phase::CaptureOnFirstTransition,
 };
 
+/// 10.3 MFRC522 command overview (Table 149.)
 #[derive(Clone, Copy)]
 enum Command {
     Idle,
@@ -440,12 +515,14 @@ impl Command {
     }
 }
 
+#[allow(missing_docs)]
 #[derive(Clone, Copy)]
-enum Register {
+pub enum Register {
     BitFraming = 0x0d,
     Coll = 0x0e,
     ComIrq = 0x04,
     Command = 0x01,
+    Control = 0x0c,
     CrcResultH = 0x21,
     CrcResultL = 0x22,
     Demod = 0x19,
@@ -458,6 +535,7 @@ enum Register {
     ReloadH = 0x2c,
     ReloadL = 0x2d,
     RxMode = 0x13,
+    Status2Reg = 0x08,
     TCountValH = 0x2e,
     TCountValL = 0x2f,
     TMode = 0x2a,
@@ -477,7 +555,8 @@ impl Register {
         ((*self as u8) << 1) | R
     }
 
-    fn write_address(&self) -> u8 {
+    /// TODO unpub
+    pub fn write_address(&self) -> u8 {
         ((*self as u8) << 1) | W
     }
 }
