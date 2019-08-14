@@ -266,14 +266,12 @@ where
         self.write(Register::FifoLevel, 1 << 7)
     }
 
-    fn transceive<RX>(
+    fn communicate(
         &mut self,
+        cmd: Command,
         tx_buffer: &[u8],
         tx_last_bits: u8,
-    ) -> Result<GenericArray<u8, RX>, Error<E>>
-    where
-        RX: ArrayLength<u8>,
-    {
+    ) -> Result<(), Error<E>> {
         // stop any ongoing command
         self.command(Command::Idle).map_err(Error::Spi)?;
 
@@ -288,7 +286,7 @@ where
             .map_err(Error::Spi)?;
 
         // signal command
-        self.command(Command::Transceive).map_err(Error::Spi)?;
+        self.command(cmd).map_err(Error::Spi)?;
 
         // configure short frame and start transmission
         self.write(Register::BitFraming, (1 << 7) | tx_last_bits)
@@ -313,22 +311,21 @@ where
         self.check_error_register()?;
         // }
 
+        Ok(())
+    }
+
+    fn transceive<RX>(
+        &mut self,
+        tx_buffer: &[u8],
+        tx_last_bits: u8,
+    ) -> Result<GenericArray<u8, RX>, Error<E>>
+    where
+        RX: ArrayLength<u8>,
+    {
+        self.communicate(Command::Transceive, tx_buffer, tx_last_bits)?;
         // grab RX data
         let mut rx_buffer: GenericArray<u8, RX> = unsafe { mem::uninitialized() };
-
-        {
-            let rx_buffer: &mut [u8] = &mut rx_buffer;
-
-            let received_bytes = self.read(Register::FifoLevel).map_err(Error::Spi)?;
-
-            if received_bytes as usize != rx_buffer.len() {
-                return Err(Error::IncompleteFrame);
-            }
-
-            self.read_many(Register::FifoData, rx_buffer)
-                .map_err(Error::Spi)?;
-        }
-
+        self.read_fifo(&mut rx_buffer)?;
         Ok(rx_buffer)
     }
 
@@ -380,6 +377,18 @@ where
 
             Ok(())
         })
+    }
+
+    fn read_fifo(&mut self, rx_buffer: &mut [u8]) -> Result<(), Error<E>> {
+        let received_bytes = self.read(Register::FifoLevel).map_err(Error::Spi)?;
+
+        if received_bytes as usize != rx_buffer.len() {
+            return Err(Error::IncompleteFrame);
+        }
+
+        self.read_many(Register::FifoData, rx_buffer)
+            .map_err(Error::Spi)?;
+        Ok(())
     }
 
     fn with_nss_low<F, T>(&mut self, f: F) -> T
