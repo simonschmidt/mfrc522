@@ -23,7 +23,8 @@
 
 #![allow(dead_code)]
 #![deny(missing_docs)]
-#![deny(warnings)]
+// NOTE: OutputPin v1/v2 business will warn
+// #![deny(warnings)]
 #![no_std]
 
 extern crate embedded_hal as hal;
