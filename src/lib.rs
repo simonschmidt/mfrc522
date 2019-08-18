@@ -210,6 +210,35 @@ where
         Ok(())
     }
 
+    pub fn mifare_write(
+        &mut self,
+        block_addr: u8,
+        buffer: &[u8],
+    ) -> Result<(), Error<E>>{
+        if (buffer.len() < 16) {
+            return Error::BufferTooSmall;
+        }
+
+        self.mifare_transceive(&[picc::MIFARE_WRITE, block_addr])?;
+        self.mifare_transceive(buffer)?;
+        Ok(())
+    }
+
+    fn mifare_transceive(&mut self, tx_buffer: &[u8]) {
+        // TODO ensure tx_buffer.len() <= 16
+
+        let mut cmdbuffer = [0; 18];
+        cmdbuffer[..tx_buffer.len()].clone_from_slice(tx_buffer);
+        let result = self.calculate_crc(&cmdbuffer[..tx_buffer.len()])?;
+        cmdbuffer[tx_buffer.len()..tx_buffer.len()+2].copy_from_slice(&result);
+
+        self.communicate(Command::Transceive,  &cmdbuffer[..tx_buffer.len()+2], 0, 1 << 3)?;
+
+        self.read_fifo(&mut cmdbuffer)?;
+
+
+
+    }
     /// Sends a REQuest type A to nearby PICCs
     pub fn reqa<'b>(&mut self) -> Result<AtqA, Error<E>> {
         // NOTE REQA is a short frame (7 bits)
@@ -256,6 +285,8 @@ where
         }
 
         let sak = rx2[0];
+        let picc_type = picc::Type::from_sak(sak);
+
 
         let compliant = match (sak & (1 << 2) != 0, sak & (1 << 5) != 0) {
             // indicates that the UID is incomplete -- this is unreachable because we only support
@@ -267,7 +298,8 @@ where
 
         Ok(Uid {
             bytes: [rx[0], rx[1], rx[2], rx[3]],
-            compliant,
+            compliant: compliant,
+            picc_type: picc_type,
         })
     }
 
@@ -580,6 +612,7 @@ pub struct AtqA {
 pub struct Uid {
     bytes: [u8; 4],
     compliant: bool,
+    picc_type: picc::Type,
 }
 
 impl Uid {
